@@ -1,83 +1,160 @@
-# Medical_Chatbot
-Build-a-Complete-Medical-Chatbot-with-LLMs-LangChain-Pinecone-Flask-AWS
-How to run?
-STEPS:
-Clone the repository
+# Medical Chatbot
 
-git clonehttps://github.com/entbappy/Build-a-Complete-Medical-Chatbot-with-LLMs-LangChain-Pinecone-Flask-AWS.git
-STEP 01- Create a conda environment after opening the repository
-conda create -n medibot python=3.10 -y
-conda activate medibot
-STEP 02- install the requirements
+A retrieval-augmented chatbot that answers medical questions **only** from a
+local corpus of reference material, and says so plainly when the corpus does not
+cover the question.
+
+The model never answers from its own knowledge. Every question is used to search
+a local vector database first; the passages that come back are pasted into the
+prompt, and the model is instructed to stay inside them. Swap the documents and
+you have a different chatbot, with no retraining.
+
+## What is in the index
+
+Three public-domain sources, in one Chroma collection of 18,388 passages:
+
+| Source | What it is | Passages |
+| --- | --- | ---: |
+| Gale Encyclopedia of Medicine | Reference book. This copy is Volume 1 only, so entries A to B. | 7,299 |
+| MedlinePlus health topics | Plain-language topic pages from the US National Library of Medicine. 2,033 topics. | 6,936 |
+| openFDA drug labels | Official labels for about 130 common generic medicines. | 4,153 |
+
+Coverage is wide but uneven, which is deliberate and visible in the tests: the
+encyclopedia is deep and stops at B, MedlinePlus is shallow and covers the whole
+alphabet.
+
+## How it works
+
+**Build time**, run once. Each source is loaded, cleaned, and cut into chunks of
+about 400 characters with 20 characters of overlap. Every chunk is turned into
+384 numbers by `sentence-transformers/all-MiniLM-L6-v2`, running locally, and
+stored in Chroma with an HNSW index.
+
+**Ask time**, on every question. The question is embedded by the same model, the
+retriever returns the passages worth reading, they are pasted into the prompt
+alongside six safety rules, and GPT-4o writes at most three sentences.
+
+Everything except the final call to GPT-4o runs on your own machine.
+
+## Setup
+
+```bash
+python -m venv .venv
+.venv/Scripts/activate        # Windows;  source .venv/bin/activate on Linux/macOS
 pip install -r requirements.txt
-Create a .env file in the root directory and add your Pinecone & openai credentials as follows:
-PINECONE_API_KEY = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-OPENAI_API_KEY = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-# run the following command to store embeddings to pinecone
-python store_index.py
-# Finally run the following command
+```
+
+Create a `.env` file in the project root:
+
+```
+OPENAI_API_KEY=sk-...
+```
+
+`.env` is gitignored. Do not commit it.
+
+## Building the index
+
+Run these once, in any order. The first run also downloads the embedding model,
+about 90 MB. Expect roughly 20 minutes in total on CPU.
+
+```bash
+python store_index.py           # the encyclopedia PDF
+python ingest_medlineplus.py    # the MedlinePlus bulk XML
+python fetch_openfda.py         # downloads drug labels, then indexes them
+```
+
+This creates `chroma_db/`, about 116 MB. It is gitignored, and generated rather
+than written by hand.
+
+Re-running `store_index.py` or `ingest_medlineplus.py` **adds** to the collection
+rather than replacing it, so running one twice will duplicate its passages. Only
+`fetch_openfda.py` clears its own previous entries first. Delete `chroma_db/` and
+rebuild if you need a clean slate.
+
+To refresh the MedlinePlus data, download a newer dated bulk file from
+<https://medlineplus.gov/xml.html> into `Data/sources/`. The ingest script picks
+the newest file matching `mplus_topics_*.xml`.
+
+## Running it
+
+```bash
 python app.py
-Now,
+```
 
-open up localhost:
-Techstack Used:
-Python
-LangChain
-Flask
-GPT
-Pinecone
-AWS-CICD-Deployment-with-Github-Actions
-1. Login to AWS console.
-2. Create IAM user for deployment
-#with specific access
+Then open <http://localhost:8080>.
 
-1. EC2 access : It is virtual machine
+Without an API key the app still starts and still retrieves. It says it cannot
+compose an answer and shows the best matching passage instead.
 
-2. ECR: Elastic Container registry to save your docker image in aws
+## Testing
 
+`tests/questions.md` holds 50 questions in six groups, each checking a different
+behaviour: answering from the encyclopedia, answering from MedlinePlus, staying
+quiet when a topic is absent, staying quiet when a topic is present but too
+shallow, refusing questions that are not medical, handling safety-sensitive
+questions, and retrieval edge cases such as bare keywords and non-English input.
 
-#Description: About the deployment
+```bash
+python app.py &                 # in one shell
+bash tests/run.sh               # in another
+```
 
-1. Build docker image of the source code
+`tests/results.md` records the answers from the last full run, in which all 50
+behave as specified.
 
-2. Push your docker image to ECR
+The most valuable groups are the ones that expect silence. Anything else measures
+whether the bot can talk. Only those measure whether it can stay quiet, which is
+the point of building it this way.
 
-3. Launch Your EC2 
+## Notes on the design
 
-4. Pull Your image from ECR in EC2
+- **Chroma, not a hosted vector database.** No account, no key, no network. It
+  will not scale to many users, which is fine for this.
+- **Local embeddings.** Free and unlimited. Embedding 18,388 chunks through an
+  API would cost money and time.
+- **MMR retrieval, not plain similarity.** With plain top-k, a question naming
+  two conditions gave every slot to whichever matched more strongly, and the bot
+  denied knowing the other one. MMR picks passages that are relevant *and*
+  unlike each other.
+- **temperature = 0.** This assistant reports what the sources say, so the same
+  question should give the same answer. At the default of 0.7 it answered on one
+  run and refused on the next, which also makes the test suite meaningless.
+- **The rule order in `src/prompt.py` is load-bearing.** Emergencies are rule 1.
+  With scope first, "I have chest pain radiating down my left arm" came back as
+  "I can only answer medical questions from my reference sources".
+- **Non-English questions are translated for the search only.** The embedding
+  model is English-only, so a Spanish question retrieved nothing at all. The
+  translation feeds the search; the answer is written from the original, in the
+  user's language.
 
-5. Lauch your docker image in EC2
+## Known limitations
 
-#Policy:
+- No conversation memory. Every request is independent, so follow-up questions
+  do not work.
+- The encyclopedia covers only A to B.
+- MedlinePlus summaries are shallow, so some reasonable questions are correctly
+  refused. "What are the stages of syphilis?" is the example in the test set.
+- Retrieval quality sets the ceiling. If the right passage never comes back, no
+  model can save the answer.
 
-1. AmazonEC2ContainerRegistryFullAccess
+## Layout
 
-2. AmazonEC2FullAccess
-3. Create ECR repo to store/save docker image
-- Save the URI: 315865595366.dkr.ecr.us-east-1.amazonaws.com/medicalbot
-4. Create EC2 machine (Ubuntu)
-5. Open EC2 and Install docker in EC2 Machine:
-#optinal
+```
+app.py                     Flask server: loads the DB, builds the chain, serves /get
+store_index.py             build step, encyclopedia PDF into Chroma
+ingest_medlineplus.py      build step, MedlinePlus XML into Chroma
+fetch_openfda.py           build step, downloads drug labels then indexes them
+src/helper.py              shared: load PDF, split text, load the embedder
+src/prompt.py              the six safety rules
+templates/chat.html        the chat page
+static/style.css           chat styling
+Data/                      source documents
+tests/                     50 questions, the runner, and the last results
+```
 
-sudo apt-get update -y
+## Disclaimer
 
-sudo apt-get upgrade
-
-#required
-
-curl -fsSL https://get.docker.com -o get-docker.sh
-
-sudo sh get-docker.sh
-
-sudo usermod -aG docker ubuntu
-
-newgrp docker
-6. Configure EC2 as self-hosted runner:
-setting>actions>runner>new self hosted runner> choose os> then run command one by one
-7. Setup github secrets:
-AWS_ACCESS_KEY_ID
-AWS_SECRET_ACCESS_KEY
-AWS_DEFAULT_REGION
-ECR_REPO
-PINECONE_API_KEY
-OPENAI_API_KEY
+This is a teaching project. It is not a medical device, it has not been
+clinically validated, and nobody should make a health decision from it. The
+`Data/Medical_book.pdf` file is included for coursework use; check the rights on
+any reference work before redistributing it.

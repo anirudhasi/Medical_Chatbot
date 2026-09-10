@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Local vector store
+chroma_db/
+
+# The MedlinePlus bulk file is committed so a clone reproduces the index
+# without a download step. Refresh it from https://medlineplus.gov/xml.html
